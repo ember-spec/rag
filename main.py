@@ -18,7 +18,7 @@ import uvicorn
 from chromadb.config import Settings
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 

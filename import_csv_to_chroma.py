@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from chromadb.config import Settings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 

@@ -23,7 +23,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from embedding import AliDashScopeEmbeddings
-from import_csv_to_chroma import build_documents, build_text_documents, load_rows_from_text
+from import_csv_to_chroma import build_documents, build_text_documents, load_rows_from_text, xlsx_to_csv_text
 
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_pro_kb")
@@ -41,7 +41,7 @@ PORT = int(os.getenv("PORT", "8000"))
 NO_ANSWER_TEXT = "暂无相关信息。知识库中暂时没有与您问题相关的资料，建议换个问法或联系人工客服。"
 
 # 文件上传入库配置
-ALLOWED_UPLOAD_EXTS = {".txt", ".md", ".csv"}
+ALLOWED_UPLOAD_EXTS = {".txt", ".md", ".csv", ".xlsx"}
 MAX_UPLOAD_MB = 5
 
 SYSTEM_PROMPT = (
@@ -148,9 +148,10 @@ async def chat_stream(req: ChatRequest):
 
 @app.post("/upload")
 async def upload_knowledge(file: UploadFile = File(...)):
-    """接收前端上传的 txt/md/csv 文件, 解析切片后向量化写入 Chroma。
+    """接收前端上传的 txt/md/csv/xlsx 文件, 解析切片后向量化写入 Chroma。
 
     - csv: 按 question/human_answers 结构解析为 QA 知识
+    - xlsx: openpyxl 读取第一个 sheet 转为 csv 流程处理
     - txt/md: 整体按 chunk_size 切片
     - 同名文件重复上传时先删旧切片再写入, 实现覆盖更新
     """
@@ -163,15 +164,22 @@ async def upload_knowledge(file: UploadFile = File(...)):
         raise HTTPException(400, "文件内容为空")
     if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(400, f"文件大小超过 {MAX_UPLOAD_MB}MB 限制")
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = raw.decode("gbk", errors="ignore")
 
-    if ext == ".csv":
+    if ext == ".xlsx":
+        try:
+            text = await asyncio.to_thread(xlsx_to_csv_text, raw)
+        except Exception as e:  # noqa: BLE001 openpyxl 解析失败统一提示
+            raise HTTPException(400, f"xlsx 解析失败, 请确认为有效的 Excel 文件: {e}")
+    else:
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = raw.decode("gbk", errors="ignore")
+
+    if ext in (".csv", ".xlsx"):
         rows = load_rows_from_text(text)
         if not rows:
-            raise HTTPException(400, "csv 中未解析到有效知识条目(需包含 question 列)")
+            raise HTTPException(400, "表格中未解析到有效知识条目(第二列问题、第三列答案)")
         docs, ids = build_documents(rows, source=filename)
     else:
         docs, ids = build_text_documents(filename, text)

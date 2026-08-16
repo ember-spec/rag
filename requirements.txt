@@ -10,3 +10,4 @@ posthog>=2.4,<3  # chromadb 0.5.x 与 posthog>=3 的 capture 签名不兼容, �
 openai>=1.40.0
 python-dotenv>=1.0.0
 python-multipart>=0.0.9
+openpyxl>=3.1.0  # 上传 .xlsx 表格入库支持

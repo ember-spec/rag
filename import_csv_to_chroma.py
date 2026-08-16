@@ -70,6 +70,23 @@ def load_rows(csv_path: str) -> List[dict]:
         return load_rows_from_text(f.read())
 
 
+def xlsx_to_csv_text(data: bytes) -> str:
+    """读取 xlsx 第一个 sheet, 转为 csv 文本以复用 csv 解析流程。"""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        buf = io.StringIO(newline="")
+        writer = csv.writer(buf)
+        for row in ws.iter_rows(values_only=True):
+            if row:  # 跳过整行为空的数据
+                writer.writerow(["" if v is None else str(v).strip() for v in row])
+        return buf.getvalue()
+    finally:
+        wb.close()
+
+
 def load_rows_from_text(text: str) -> List[dict]:
     """解析 csv 文本内容, 每一行封装为一条知识素材(question/answer), 过滤空值。"""
     rows: List[dict] = []

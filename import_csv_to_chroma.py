@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from chromadb.config import Settings
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -178,22 +179,23 @@ def main() -> None:
         api_key=EMBEDDING_API_KEY, base_url=EMBEDDING_BASE_URL, model=EMBEDDING_MODEL
     )
 
-    if args.rebuild:
-        import chromadb
+    def _make_vectorstore() -> Chroma:
+        return Chroma(
+            collection_name=COLLECTION_NAME,
+            embedding_function=embeddings,
+            persist_directory=CHROMA_DIR,
+            collection_metadata={"hnsw:space": "cosine"},  # 余弦相似度
+            client_settings=Settings(anonymized_telemetry=False, is_persistent=True),
+        )
 
-        client = chromadb.PersistentClient(path=CHROMA_DIR)
+    vectorstore = _make_vectorstore()
+    if args.rebuild:
         try:
-            client.delete_collection(COLLECTION_NAME)
+            vectorstore.delete_collection()
             log.info("已删除旧集合 %s, 开始全量重建", COLLECTION_NAME)
         except Exception:  # noqa: BLE001 集合不存在时忽略
             pass
-
-    vectorstore = Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=embeddings,
-        persist_directory=CHROMA_DIR,
-        collection_metadata={"hnsw:space": "cosine"},  # 余弦相似度
-    )
+        vectorstore = _make_vectorstore()
 
     start = time.time()
     batch = 32

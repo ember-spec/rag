@@ -29,6 +29,12 @@ class AliDashScopeEmbeddings(Embeddings):
         self.model = model
         self.batch_size = batch_size
         self.max_retries = max_retries
+        if not api_key or not api_key.isascii() or api_key.strip().startswith("sk-你的"):
+            raise ValueError(
+                f"DASHSCOPE_API_KEY 未正确配置(当前值: {api_key[:12]!r})。"
+                "请在 .env 第 2 行填入真实的阿里云 API Key(sk- 开头), "
+                "获取地址: https://bailian.console.aliyun.com/"
+            )
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:

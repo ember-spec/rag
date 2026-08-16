@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import uvicorn
+from chromadb.config import Settings
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from langchain_community.vectorstores import Chroma
@@ -59,6 +60,7 @@ vectorstore = Chroma(
     collection_name=COLLECTION_NAME,
     embedding_function=embeddings,
     persist_directory=CHROMA_DIR,
+    client_settings=Settings(anonymized_telemetry=False, is_persistent=True),
 )
 llm = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 

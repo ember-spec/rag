@@ -11,3 +11,5 @@ openai>=1.40.0
 python-dotenv>=1.0.0
 python-multipart>=0.0.9
 openpyxl>=3.1.0  # 上传 .xlsx 表格入库支持
+python-docx>=1.1.0  # 上传/解压 .docx 文档入库支持
+pypdf>=4.0.0  # 上传/解压 .pdf 文档入库支持

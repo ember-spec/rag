@@ -7,12 +7,22 @@
 """
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+log = logging.getLogger("rag-pro")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+    # uvicorn 启动会重配 root logger, 关闭传播避免日志被吞
+    log.propagate = False
 
 import uvicorn
 from chromadb.config import Settings
@@ -22,8 +32,16 @@ from langchain_chroma import Chroma
 from openai import AsyncOpenAI
 from pydantic import BaseModel
 
+from archive_extractor import ArchiveError, extract_archive, is_zip
 from embedding import AliDashScopeEmbeddings
-from import_csv_to_chroma import build_documents, build_text_documents, load_rows_from_text, xlsx_to_csv_text
+from import_csv_to_chroma import (
+    build_documents,
+    build_text_documents,
+    docx_to_text,
+    load_rows_from_text,
+    pdf_to_text,
+    xlsx_to_csv_text,
+)
 
 CHROMA_DIR = os.getenv("CHROMA_DIR", "chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_pro_kb")
@@ -41,8 +59,9 @@ PORT = int(os.getenv("PORT", "8000"))
 NO_ANSWER_TEXT = "暂无相关信息。知识库中暂时没有与您问题相关的资料，建议换个问法或联系人工客服。"
 
 # 文件上传入库配置
-ALLOWED_UPLOAD_EXTS = {".txt", ".md", ".csv", ".xlsx"}
-MAX_UPLOAD_MB = 5
+ALLOWED_UPLOAD_EXTS = {".txt", ".md", ".csv", ".xlsx", ".docx", ".pdf", ".zip"}
+MAX_UPLOAD_MB = 5          # 普通文档上传大小上限(MB)
+MAX_ARCHIVE_MB = 20       # 压缩包上传大小上限(MB)
 
 SYSTEM_PROMPT = (
     "你是企业内部知识库客服助手，必须严格遵守以下规则：\n"
@@ -146,54 +165,141 @@ async def chat_stream(req: ChatRequest):
     )
 
 
+def _decode_text(raw: bytes) -> str:
+    """尝试 utf-8-sig, 失败回退 gbk 解码纯文本。"""
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("gbk", errors="ignore")
+
+
+async def _build_docs_for_file(filename: str, raw: bytes):
+    """处理单个文档字节, 返回 (docs, ids, source)。解析失败时返回空列表。
+
+    - csv/xlsx: 按 question/human_answers QA 结构解析切片
+    - txt/md/docx/pdf: 整体提取文本后按 chunk_size 切片
+    """
+    ext = Path(filename).suffix.lower()
+    log.info("[切片] 开始处理文件: %s (扩展名=%s, 大小=%d, %.2fKB)",
+             filename, ext, len(raw), len(raw) / 1024)
+    try:
+        if ext == ".xlsx":
+            text = await asyncio.to_thread(xlsx_to_csv_text, raw)
+            rows = load_rows_from_text(text)
+            if not rows:
+                log.warning("[切片] 文件 %s 未解析到有效知识条目, 跳过", filename)
+                return [], [], filename
+            docs, ids = build_documents(rows, source=filename)
+        elif ext == ".csv":
+            rows = load_rows_from_text(_decode_text(raw))
+            if not rows:
+                log.warning("[切片] 文件 %s 未解析到有效知识条目, 跳过", filename)
+                return [], [], filename
+            docs, ids = build_documents(rows, source=filename)
+        elif ext == ".docx":
+            text = await asyncio.to_thread(docx_to_text, raw)
+            docs, ids = build_text_documents(filename, text)
+        elif ext == ".pdf":
+            text = await asyncio.to_thread(pdf_to_text, raw)
+            docs, ids = build_text_documents(filename, text)
+        elif ext in (".txt", ".md"):
+            docs, ids = build_text_documents(filename, _decode_text(raw))
+        else:
+            log.warning("[切片] 文件 %s 扩展名 %s 不在支持范围, 跳过", filename, ext)
+            return [], [], filename
+    except Exception as e:  # noqa: BLE001 单个文件解析失败, 跳过该文件继续处理其余
+        log.warning("[切片] 文件 %s 解析失败, 已跳过: %s", filename, e)
+        return [], [], filename
+    log.info("[切片] 文件 %s 切片完成: 生成 %d 个切片", filename, len(docs))
+    return docs, ids, filename
+
+
 @app.post("/upload")
 async def upload_knowledge(file: UploadFile = File(...)):
-    """接收前端上传的 txt/md/csv/xlsx 文件, 解析切片后向量化写入 Chroma。
+    """接收前端上传的普通文档或 zip 压缩包, 解析切片后向量化写入 Chroma。
 
-    - csv: 按 question/human_answers 结构解析为 QA 知识
-    - xlsx: openpyxl 读取第一个 sheet 转为 csv 流程处理
-    - txt/md: 整体按 chunk_size 切片
-    - 同名文件重复上传时先删旧切片再写入, 实现覆盖更新
+    - 普通文档(txt/md/csv/xlsx/docx/pdf): 直接解析切片入库
+    - zip 压缩包: 递归解压(最多 3 层), 对内部 md/txt/docx/pdf/csv/xlsx 等
+      文档逐一提取切片入库; 层级超限的嵌套压缩包直接丢弃
+    - 同名来源重复上传时先删旧切片再写入, 实现覆盖更新
     """
     filename = file.filename or "untitled"
     ext = Path(filename).suffix.lower()
-    if ext not in ALLOWED_UPLOAD_EXTS:
-        raise HTTPException(400, f"仅支持 {'/'.join(sorted(ALLOWED_UPLOAD_EXTS))} 格式文件")
     raw = await file.read()
+    log.info("[上传] 收到文件: %s (扩展名=%s, 大小=%d, %.2fKB)",
+             filename, ext, len(raw), len(raw) / 1024)
     if not raw.strip():
+        log.warning("[上传] 文件 %s 内容为空", filename)
         raise HTTPException(400, "文件内容为空")
-    if len(raw) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(400, f"文件大小超过 {MAX_UPLOAD_MB}MB 限制")
 
-    if ext == ".xlsx":
-        try:
-            text = await asyncio.to_thread(xlsx_to_csv_text, raw)
-        except Exception as e:  # noqa: BLE001 openpyxl 解析失败统一提示
-            raise HTTPException(400, f"xlsx 解析失败, 请确认为有效的 Excel 文件: {e}")
-    else:
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("gbk", errors="ignore")
+    is_archive = ext == ".zip" or is_zip(raw)
+    size_limit = MAX_ARCHIVE_MB if is_archive else MAX_UPLOAD_MB
+    if len(raw) > size_limit * 1024 * 1024:
+        log.error("[上传] 文件 %s 大小 %d 超过 %dMB 限制", filename, len(raw), size_limit)
+        raise HTTPException(400, f"文件大小超过 {size_limit}MB 限制")
 
-    if ext in (".csv", ".xlsx"):
-        rows = load_rows_from_text(text)
-        if not rows:
-            raise HTTPException(400, "表格中未解析到有效知识条目(第二列问题、第三列答案)")
-        docs, ids = build_documents(rows, source=filename)
+    all_docs, all_ids, sources = [], [], []
+
+    if is_archive:
+        # 压缩包: 递归解压后逐一处理内部文档
+        log.info("[上传] %s 为压缩包, 开始递归解压", filename)
+        try:
+            extracted = await asyncio.to_thread(extract_archive, raw)
+        except ArchiveError as e:
+            log.error("[上传] 压缩包 %s 解压失败: %s", filename, e)
+            raise HTTPException(400, f"压缩包解压失败: {e}")
+        log.info("[上传] 解压得到可解析文档 %d 个, 开始逐一切片", len(extracted))
+        if not extracted:
+            raise HTTPException(400, "压缩包内未找到可解析文档(txt/md/csv/xlsx/docx/pdf)")
+
+        skipped = 0
+        for i, (inner_name, inner_bytes) in enumerate(extracted, 1):
+            log.info("[上传] 处理解压文件 %d/%d: %s", i, len(extracted), inner_name)
+            docs, ids, src = await _build_docs_for_file(inner_name, inner_bytes)
+            if not docs:
+                skipped += 1
+                continue
+            all_docs.extend(docs)
+            all_ids.extend(ids)
+            sources.append(src)
+        log.info("[上传] 切片汇总: 成功 %d 个文件, 跳过 %d 个, 切片总数 %d",
+                 len(sources), skipped, len(all_docs))
+        if not all_docs:
+            raise HTTPException(400, f"压缩包内 {skipped} 个文档均解析失败, 未生成有效切片")
     else:
-        docs, ids = build_text_documents(filename, text)
-    if not docs:
-        raise HTTPException(400, "未生成任何有效切片")
+        if ext not in ALLOWED_UPLOAD_EXTS:
+            log.warning("[上传] 文件 %s 扩展名 %s 不在支持范围", filename, ext)
+            raise HTTPException(
+                400,
+                f"仅支持 {'/'.join(sorted(ALLOWED_UPLOAD_EXTS))} 格式文件",
+            )
+        docs, ids, src = await _build_docs_for_file(filename, raw)
+        if not docs:
+            raise HTTPException(400, "未生成任何有效切片")
+        all_docs.extend(docs)
+        all_ids.extend(ids)
+        sources.append(src)
 
     def _write():
-        # 同名文件覆盖更新: 先删除该来源的旧切片
-        vectorstore._collection.delete(where={"source": filename})
-        vectorstore.add_documents(docs, ids=ids)
-        return vectorstore._collection.count()
+        # 覆盖更新: 删除本次涉及来源的旧切片, 再写入新切片
+        log.info("[入库] 开始删除旧切片, 涉及来源 %d 个: %s", len(sources), sources)
+        vectorstore._collection.delete(where={"source": {"$in": sources}})
+        log.info("[入库] 旧切片删除完成, 开始写入新切片 %d 个", len(all_docs))
+        vectorstore.add_documents(all_docs, ids=all_ids)
+        count = vectorstore._collection.count()
+        log.info("[入库] 写入完成, 当前集合总数 %d", count)
+        return count
 
     total = await asyncio.to_thread(_write)
-    return {"success": True, "filename": filename, "added": len(docs), "total": total}
+    log.info("[上传] 全流程完成: 文件=%s, 新增切片=%d, 知识库总数=%d",
+             filename, len(all_docs), total)
+    return {
+        "success": True,
+        "filename": filename,
+        "added": len(all_docs),
+        "total": total,
+        "sources": sources,
+    }
 
 
 if __name__ == "__main__":

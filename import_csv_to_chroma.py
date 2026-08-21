@@ -87,6 +87,34 @@ def xlsx_to_csv_text(data: bytes) -> str:
         wb.close()
 
 
+def docx_to_text(data: bytes) -> str:
+    """读取 docx 文档纯文本(段落与表格文本按换行拼接)。"""
+    from docx import Document
+
+    doc = Document(io.BytesIO(data))
+    parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    # 表格内文本同样纳入, 避免丢失结构化内容
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                parts.append("\t".join(cells))
+    return "\n".join(parts)
+
+
+def pdf_to_text(data: bytes) -> str:
+    """读取 pdf 文档纯文本(按页提取并拼接)。"""
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    parts = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts)
+
+
 def load_rows_from_text(text: str) -> List[dict]:
     """解析 csv 文本内容, 每一行封装为一条知识素材(question/answer), 过滤空值。"""
     rows: List[dict] = []

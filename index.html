@@ -99,8 +99,8 @@
   </div>
   <div class="chat-input">
     <textarea id="queryInput" rows="1" placeholder="请输入您的问题，Enter 发送，Shift+Enter 换行"></textarea>
-    <input type="file" id="fileInput" accept=".txt,.md,.csv,.xlsx" style="display:none" />
-    <button class="upload-btn" id="uploadBtn" title="上传知识文件(txt/md/csv/xlsx)入库">📎</button>
+    <input type="file" id="fileInput" accept=".txt,.md,.csv,.xlsx,.docx,.pdf,.zip" style="display:none" />
+    <button class="upload-btn" id="uploadBtn" title="上传知识文件(txt/md/csv/xlsx/docx/pdf/zip)入库">📎</button>
     <button class="send-btn" id="sendBtn">发送</button>
   </div>
 </div>
@@ -183,7 +183,10 @@ async function uploadFile() {
       const resp = await fetch('/upload', { method: 'POST', body: fd });
       const data = await resp.json().catch(() => null);
       if (resp.ok && data && data.success) {
-        addSystemNote(`入库成功: ${data.filename} 新增 ${data.added} 条切片, 当前知识库共 ${data.total} 条`);
+        const sourcesInfo = (data.sources && data.sources.length > 1)
+          ? `, 来源 ${data.sources.length} 个文件`
+          : '';
+        addSystemNote(`入库成功: ${data.filename}${sourcesInfo} 新增 ${data.added} 条切片, 当前知识库共 ${data.total} 条`);
       } else {
         addSystemNote(`上传失败: ${(data && data.detail) || ('HTTP ' + resp.status)}`, true);
       }
